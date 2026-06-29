@@ -620,22 +620,79 @@ function Get-AMDDriver {
 function Get-IntelDownloadId {
     <#
     .SYNOPSIS
-        Determine which Intel download page ID to use based on GPU name and driver version.
+        Determine which Intel download page ID to use based on CPU generation (primary)
+        with GPU name as fallback.
     .DESCRIPTION
         Intel has three separate download pages for different GPU generations:
-          ID 785597  Arc / Iris Xe / Core Ultra (newest unified driver, v32.x)
-          ID 864990  11th-14th Gen Processor Graphics (v32.x, older builds)
-          ID 776137  7th-10th Gen Processor Graphics (v31.x legacy)
-        Detection rules:
-          "Arc" in name         -> 785597
-          "Iris Xe" in name     -> 785597 (or 864990 as fallback)
-          "UHD" or "HD Graphics" with driver 32.x -> 864990 (11th-14th)
-          "UHD" or "HD Graphics" with driver 31.x -> 776137 (7th-10th)
-          Unknown / "Graphics"  -> 785597 (try newest first, it covers most)
+          ID 785597  Arc discrete / Core Ultra integrated (newest unified driver)
+          ID 864990  11th-14th Gen Processor Graphics (Tiger Lake → Raptor Lake Refresh)
+          ID 776137  7th-10th Gen Processor Graphics and older (legacy)
+        Detection rules (in priority order):
+          1. GPU name contains "Arc" (discrete GPU)         -> 785597
+          2. CPU model contains "Ultra" (Core Ultra Series)  -> 785597
+          3. CPU model implies 11th-14th Gen                 -> 864990
+          4. CPU model implies ≤10th Gen                     -> 776137
+          5. Fallback: GPU name + driver version heuristics
     #>
     param([string]$GpuName)
 
-    # Get current driver version for generation hint
+    $name = $GpuName
+
+    # Rule 1: Discrete Arc GPU always uses the newest unified driver
+    if ($name -match "Arc\b") {
+        Write-OK "Detected: Intel Arc (discrete) -> ID 785597"
+        return "785597/intel-arc-graphics-windows"
+    }
+
+    # --- CPU-based detection (Win32_Processor) ---
+    try {
+        $cpu = Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop |
+            Where-Object { $_.Manufacturer -match "GenuineIntel|Intel" } |
+            Select-Object -First 1
+        $cpuName = $cpu.Name
+    } catch { $cpuName = $null }
+
+    if ($cpuName) {
+        Write-OK "CPU: $cpuName"
+
+        # Core Ultra (Meteor Lake / Lunar Lake / Arrow Lake) -> 785597
+        if ($cpuName -match "\bUltra\b") {
+            Write-OK "Detected: Core Ultra -> ID 785597"
+            return "785597/intel-arc-graphics-windows"
+        }
+
+        # 11th Gen  i?-11xxx  (Tiger Lake)
+        # 12th Gen  i?-12xxx  (Alder Lake)
+        # 13th Gen  i?-13xxx  (Raptor Lake)
+        # 14th Gen  i?-14xxx  (Raptor Lake Refresh)
+        # Also matches "N??" (i3-N305) Alder Lake-N -> 864990
+        if ($cpuName -match '\b(?:i[3579]-)?(?:11|12|13|14)\d{2,3}[A-Z]*\b' -or
+            $cpuName -match '\bN\d{2,4}\b') {
+            Write-OK "Detected: 11th-14th Gen -> ID 864990"
+            return "864990/intel-11th-14th-gen-processor-graphics-windows"
+        }
+
+        # 7th-10th Gen  i?-7xxx through i?-10xxx
+        # Kaby Lake / Coffee Lake / Whiskey Lake / Comet Lake / Ice Lake
+        if ($cpuName -match '\b(?:i[3579]-)?(?:7|8|9|10)\d{2,3}[A-Z]*\b') {
+            Write-OK "Detected: 7th-10th Gen -> ID 776137"
+            return "776137/intel-7th-10th-gen-processor-graphics-windows"
+        }
+
+        # 4th-6th Gen  i?-4xxx / i?-5xxx / i?-6xxx
+        if ($cpuName -match '\b(?:i[3579]-)?[4-6]\d{2,3}[A-Z]*\b') {
+            Write-OK "Detected: 4th-6th Gen (legacy) -> ID 776137"
+            return "776137/intel-7th-10th-gen-processor-graphics-windows"
+        }
+
+        # Pentium / Celeron / Atom -> legacy
+        if ($cpuName -match '\b(Pentium|Celeron|Atom)\b') {
+            Write-OK "Detected: Legacy CPU ($Matches[1]) -> ID 776137"
+            return "776137/intel-7th-10th-gen-processor-graphics-windows"
+        }
+    }
+
+    # --- Fallback: GPU name + driver version heuristics ---
     try {
         $gpu = Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop |
             Where-Object { $_.Name -match "Intel|Arc|Iris|UHD|HD Graphics" } |
@@ -643,35 +700,25 @@ function Get-IntelDownloadId {
         $drvVer = $gpu.DriverVersion
     } catch { $drvVer = "32.0" }
 
-    $name = $GpuName
+    if ($name -match "Iris\s+Xe") {
+        Write-OK "Detected: Intel Iris Xe -> ID 785597"
+        return "785597/intel-arc-graphics-windows"
+    }
 
-    # Arc / Iris Xe / Core Ultra Graphics -> newest driver (785597)
-    if ($name -match "Arc\b")    { Write-OK "Detected: Intel Arc -> ID 785597"; return "785597/intel-arc-graphics-windows" }
-    if ($name -match "Iris\s+Xe") { Write-OK "Detected: Intel Iris Xe -> ID 785597"; return "785597/intel-arc-graphics-windows" }
-
-    # By driver version:
-    #   15.x  = 4th/5th Gen (Haswell/Broadwell) or older -> legacy 776137
-    #   20.x  = 6th Gen (Skylake) -> legacy 776137
-    #   31.x  = 7th-10th Gen -> legacy 776137
-    #   32.x  = 11th+ / Arc -> newest 785597 or 864990
+    # Driver version hints
     if ($drvVer -match "^15\.|^20\.|^31\." -or $drvVer -match "^10\." -or [version]$drvVer -lt [version]"31.0") {
-        Write-OK "Detected: Legacy driver (v$drvVer) -> ID 776137 (7th-10th Gen)"
+        Write-OK "Detected: Legacy driver (v$drvVer) -> ID 776137"
         return "776137/intel-7th-10th-gen-processor-graphics-windows"
     }
 
-    # Check GPU name for older HD Graphics models
     if ($name -match "HD\s*Graphics\s*(\d{3,4})") {
         $model = [int]$Matches[1]
-        # HD 5000/4000/3000/etc = 4th Gen or older -> legacy
-        # HD 5xx = 6th Gen -> legacy
-        # HD 6xx = 7th-10th Gen -> legacy
         if ($model -lt 700) {
             Write-OK "Detected: HD Graphics $model -> ID 776137 (legacy)"
             return "776137/intel-7th-10th-gen-processor-graphics-windows"
         }
     }
 
-    # UHD Graphics: split by driver version
     if ($name -match "UHD\s*Graphics") {
         if ($drvVer -match "^32\.") {
             Write-OK "Detected: UHD Graphics (v32.x) -> ID 864990 (11th-14th Gen)"
@@ -682,14 +729,13 @@ function Get-IntelDownloadId {
         }
     }
 
-    # Unknown Intel GPU with 32.x driver -> try 864990 first (covers 11th-14th Gen)
+    # Unknown 32.x driver -> try 864990
     if ($drvVer -match "^32\.") {
-        Write-OK "Detected: Intel Graphics (v32.x) -> ID 864990 (11th-14th Gen)"
+        Write-OK "Detected: Intel Graphics (v32.x) -> ID 864990"
         return "864990/intel-11th-14th-gen-processor-graphics-windows"
     }
 
-    # Default: newest unified driver (covers Arc-era and unknown)
-    Write-OK "Detected: Modern Intel Graphics -> ID 785597"
+    Write-OK "Detected: Unknown Intel Graphics -> ID 785597"
     return "785597/intel-arc-graphics-windows"
 }
 
