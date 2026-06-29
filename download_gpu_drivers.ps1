@@ -671,12 +671,24 @@ function Get-IntelDownloadId {
         }
     }
 
-    if ($name -match "UHD\s*Graphics" -and $drvVer -notmatch "^32\.") {
-        Write-OK "Detected: UHD Graphics (legacy driver) -> ID 776137"
-        return "776137/intel-7th-10th-gen-processor-graphics-windows"
+    # UHD Graphics: split by driver version
+    if ($name -match "UHD\s*Graphics") {
+        if ($drvVer -match "^32\.") {
+            Write-OK "Detected: UHD Graphics (v32.x) -> ID 864990 (11th-14th Gen)"
+            return "864990/intel-11th-14th-gen-processor-graphics-windows"
+        } else {
+            Write-OK "Detected: UHD Graphics (legacy driver) -> ID 776137"
+            return "776137/intel-7th-10th-gen-processor-graphics-windows"
+        }
     }
 
-    # Default: newest unified driver (covers most modern Intel GPUs)
+    # Unknown Intel GPU with 32.x driver -> try 864990 first (covers 11th-14th Gen)
+    if ($drvVer -match "^32\.") {
+        Write-OK "Detected: Intel Graphics (v32.x) -> ID 864990 (11th-14th Gen)"
+        return "864990/intel-11th-14th-gen-processor-graphics-windows"
+    }
+
+    # Default: newest unified driver (covers Arc-era and unknown)
     Write-OK "Detected: Modern Intel Graphics -> ID 785597"
     return "785597/intel-arc-graphics-windows"
 }
@@ -724,9 +736,37 @@ function Get-IntelDriver {
     }
 
     if (-not $downloadUrl) {
-        Write-Err "Cannot find Intel driver. Please visit:"
-        Write-Warn "  $pageUrl"
-        return $null
+        # Fallback: if 864990 failed, try 785597 (newest unified driver covers more GPUs)
+        if ($downloadId -match "^864990") {
+            Write-Warn "864990 page failed, falling back to 785597..."
+            $downloadId = "785597/intel-arc-graphics-windows"
+            $pageUrl = "https://www.intel.cn/content/www/cn/zh/download/$downloadId.html"
+            Write-Step "Accessing fallback Intel download center..."
+            Write-OK "Page: $pageUrl"
+            try {
+                $resp = Get-StableWebContent -Uri $pageUrl -Headers @{ "Referer" = "https://www.intel.cn/" }
+                $html = $resp.Content
+                $dmPat = "https://downloadmirror\.intel\.com/\d+/[^\""\s<>]+\.exe"
+                $dmMatches = [regex]::Matches($html, $dmPat, "IgnoreCase")
+                Write-OK "Found $($dmMatches.Count) downloadmirror link(s)"
+                if ($dmMatches.Count -gt 0) {
+                    $downloadUrl = [System.Web.HttpUtility]::HtmlDecode($dmMatches[0].Value)
+                    Write-OK "  $downloadUrl"
+                    if ($downloadUrl -match 'gfx_win_(\d+)\.(\d+)\.exe') {
+                        $driverVersion = "32.0.$($Matches[1]).$($Matches[2])"
+                    }
+                    Write-OK "Latest version: $driverVersion"
+                }
+            } catch {
+                Write-Err "Cannot access fallback page either: $_"
+            }
+        }
+
+        if (-not $downloadUrl) {
+            Write-Err "Cannot find Intel driver. Please visit:"
+            Write-Warn "  $pageUrl"
+            return $null
+        }
     }
 
     $downloadUrl = [System.Web.HttpUtility]::HtmlDecode($downloadUrl)
